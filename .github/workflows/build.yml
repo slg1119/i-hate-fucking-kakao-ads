@@ -1,0 +1,21 @@
+name: macOS build
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build native app
+        run: bash scripts/build.sh
+      - name: Verify hardened ad-hoc library loading
+        run: bash scripts/test-loader.sh
+      - name: Package DMG
+        run: bash scripts/package-dmg.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NoAdKakao-arm64
+          path: |
+            dist/*.dmg
+            dist/SHA256SUMS.txt

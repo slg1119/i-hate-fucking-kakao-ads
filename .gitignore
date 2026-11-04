@@ -1,0 +1,7 @@
+analysis/
+__pycache__/
+.build/
+dist/
+.DS_Store
+KakaoTalk-NoAds.app/
+.codebase-memory/

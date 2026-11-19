@@ -47,7 +47,7 @@ import UniformTypeIdentifiers
         guard restore ? canRestore : (repair ? canRepair : canApply) else { return }
         if !restore {
             let consent = NSAlert(); consent.messageText = "카카오톡에 서명 예외를 적용할까요?"
-            consent.informativeText = "수정된 앱의 실행을 위해 이 카카오톡과 포함된 보조 앱의 라이브러리 서명 검증을 완화합니다. 다른 개발자가 서명한 라이브러리도 불러올 수 있게 됩니다.\n\nmacOS 전체 보안 설정은 유지되며, 원본 복원 시 이 예외도 제거됩니다. 실행 중인 카카오톡은 강제 종료합니다. 작성 중인 내용이 저장되지 않을 수 있습니다."
+            consent.informativeText = "수정된 앱의 실행을 위해 이 카카오톡과 포함된 보조 앱의 라이브러리 서명 검증을 완화합니다. 다른 개발자가 서명한 라이브러리도 불러올 수 있게 됩니다.\n\n광고 외 기능에도 영향을 줄 수 있으며 실제 화면과 로그인은 검증되지 않았습니다.\n\nmacOS 전체 보안 설정은 유지되며, 원본 복원 시 이 예외도 제거됩니다. 실행 중인 카카오톡은 강제 종료합니다. 작성 중인 내용이 저장되지 않을 수 있습니다."
             consent.addButton(withTitle: "예외를 허용하고 \(repair ? "복구" : "적용")")
             consent.addButton(withTitle:"취소")
             guard consent.runModal() == .alertFirstButtonReturn else { return }
@@ -214,7 +214,13 @@ struct ContentView: View {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     init() {
         if CommandLine.arguments.contains("--self-test") {
-            do { try EngineTests.run(); exit(0) } catch { fputs("SELF-TEST FAILED: \(error)\n",stderr); exit(1) }
+            do {
+                func argument(_ name: String) -> String? {
+                    guard let index = CommandLine.arguments.firstIndex(of:name), index + 1 < CommandLine.arguments.count else { return nil }
+                    return CommandLine.arguments[index + 1]
+                }
+                try EngineTests.run(sourcePath:argument("--source-app"), legacySourcePath:argument("--legacy-source-app")); exit(0)
+            } catch { fputs("SELF-TEST FAILED: \(error)\n",stderr); exit(1) }
         }
         NSApplication.shared.setActivationPolicy(.regular)
     }

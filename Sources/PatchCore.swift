@@ -8,28 +8,66 @@ enum PatchFailure: LocalizedError {
     var errorDescription: String? { if case .message(let s) = self { return s }; return nil }
 }
 
+struct PatchSite {
+    let offset: Int
+    let original: Data
+    let replacement: Data
+}
+
+struct PatchProfile {
+    let version: String
+    let originalHash: String
+    let unsignedPatchedHash: String
+    let armHash: String
+    let sites: [PatchSite]
+}
+
 enum PatchSpec {
     static let bundleID = "com.kakao.KakaoTalkMac"
-    static let originalHash = "456e1a3ed7a87168888bdb8c6e4894764a028e62c0af68562a760d9909d2bb65"
-    static let unsignedPatchedHash = "c2b646df3798f94ddff7e99d32b22fd41e07afc0237227f4b2299454ba867c6c"
-    static let armHash = "16cbbfe19557b33ceeef6f490c3eb0abf4b047425a261a3c84ae496bd180d83b"
-    static let offset = 0xb0a4b0
-    static let original = Data([0xf4,0x4f,0xbe,0xa9,0xfd,0x7b,0x01,0xa9])
-    static let replacement = Data([0x00,0x00,0x80,0x52,0xc0,0x03,0x5f,0xd6])
+    static let legacy = PatchProfile(
+        version: "26.9.0 (2006)",
+        originalHash: "456e1a3ed7a87168888bdb8c6e4894764a028e62c0af68562a760d9909d2bb65",
+        unsignedPatchedHash: "c2b646df3798f94ddff7e99d32b22fd41e07afc0237227f4b2299454ba867c6c",
+        armHash: "16cbbfe19557b33ceeef6f490c3eb0abf4b047425a261a3c84ae496bd180d83b",
+        sites: [PatchSite(offset: 0xb0a4b0,
+                          original: Data([0xf4,0x4f,0xbe,0xa9,0xfd,0x7b,0x01,0xa9]),
+                          replacement: Data([0x00,0x00,0x80,0x52,0xc0,0x03,0x5f,0xd6]))]
+    )
+    static let current = PatchProfile(
+        version: "26.10.0 (2010)",
+        originalHash: "0c2b8d4d1240cffedde7232f04c7fc3875b3f667d16a69e3ed99b2bed9e83f4f",
+        unsignedPatchedHash: "3ce9ce0e865fe96b5210a83c1825743b89583f66388a66ce4a480e7a4b443b4e",
+        armHash: "d2b310d0122e4db3bb574b2844045b84ca782b0bcf94f8131503ee34892a5463",
+        sites: [
+            PatchSite(offset: 0x11e0958, original: Data([0xef,0x29,0xfa,0x97]), replacement: Data([0x00,0x00,0x80,0x52])),
+            PatchSite(offset: 0x11e09b4, original: Data([0xd8,0x29,0xfa,0x97]), replacement: Data([0x00,0x00,0x80,0x52])),
+            PatchSite(offset: 0x1479940, original: Data([0x80,0x04,0x00,0x36]), replacement: Data([0x24,0x00,0x00,0x14]))
+        ]
+    )
+    static let profiles = [legacy, current]
+    static func profile(for hash: String) -> PatchProfile? { profiles.first { $0.originalHash == hash } }
     static func hash(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
     static func hashFile(_ url: URL) throws -> String { hash(try Data(contentsOf: url, options: .mappedIfSafe)) }
 
     static func patch(_ input: Data) throws -> Data {
-        guard hash(input) == originalHash else { throw PatchFailure.message("분석된 26.9.0 (2006) 빌드와 다릅니다. 이 버전은 적용할 수 없습니다.") }
+        guard let profile = profile(for: hash(input)) else { throw PatchFailure.message("분석된 카카오톡 빌드와 다릅니다. 이 버전은 적용할 수 없습니다.") }
         let slices = try MachO.slices(input)
-        guard let arm = slices.first(where: { $0.cpu == 0x0100000c }), hash(input.subdata(in: arm.offset..<arm.offset+arm.size)) == armHash else {
+        guard let arm = slices.first(where: { $0.cpu == 0x0100000c }), hash(input.subdata(in: arm.offset..<arm.offset+arm.size)) == profile.armHash else {
             throw PatchFailure.message("지원하는 Apple Silicon 실행 파일이 아닙니다.")
         }
-        let p = arm.offset + offset
-        guard input.subdata(in: p..<p+8) == original else { throw PatchFailure.message("수정 지점이 분석 결과와 다릅니다.") }
         var result = input
-        result.replaceSubrange(p..<p+8, with: replacement)
-        guard hash(result) == unsignedPatchedHash else { throw PatchFailure.message("패치 결과 검증에 실패했습니다.") }
+        for site in profile.sites {
+            guard !site.original.isEmpty, site.original.count == site.replacement.count,
+                  site.offset >= 0, site.offset <= arm.size - site.original.count else {
+                throw PatchFailure.message("수정 지점 범위가 올바르지 않습니다.")
+            }
+            let p = arm.offset + site.offset
+            guard input.subdata(in: p..<p+site.original.count) == site.original else {
+                throw PatchFailure.message("수정 지점이 분석 결과와 다릅니다.")
+            }
+            result.replaceSubrange(p..<p+site.original.count, with: site.replacement)
+        }
+        guard hash(result) == profile.unsignedPatchedHash else { throw PatchFailure.message("패치 결과 검증에 실패했습니다.") }
         return result
     }
 }
@@ -121,12 +159,16 @@ final class PatchEngine {
         self.allowAdministrator = allowAdministrator
     }
     func binary(_ app: URL) -> URL { app.appendingPathComponent("Contents/MacOS/KakaoTalk") }
-    func backupDirectory(_ app: URL) -> URL { backupRoot.appendingPathComponent(String(PatchSpec.hash(Data(app.standardizedFileURL.path.utf8)).prefix(24))) }
-    func recordURL(_ app: URL) -> URL { backupDirectory(app).appendingPathComponent("record.json") }
-    func loadRecord(_ app: URL) throws -> BackupRecord { try JSONDecoder().decode(BackupRecord.self, from: Data(contentsOf: recordURL(app))) }
-    func saveRecord(_ r: BackupRecord, _ app: URL) throws {
+    func backupDirectory(_ app: URL, profile: PatchProfile = PatchSpec.legacy) -> URL {
+        let pathKey = String(PatchSpec.hash(Data(app.standardizedFileURL.path.utf8)).prefix(24))
+        let suffix = profile.originalHash == PatchSpec.legacy.originalHash ? "" : "-" + String(profile.originalHash.prefix(16))
+        return backupRoot.appendingPathComponent(pathKey + suffix)
+    }
+    func recordURL(_ app: URL, profile: PatchProfile = PatchSpec.legacy) -> URL { backupDirectory(app, profile: profile).appendingPathComponent("record.json") }
+    func loadRecord(_ app: URL, profile: PatchProfile = PatchSpec.legacy) throws -> BackupRecord { try JSONDecoder().decode(BackupRecord.self, from: Data(contentsOf: recordURL(app, profile: profile))) }
+    func saveRecord(_ r: BackupRecord, _ app: URL, profile: PatchProfile = PatchSpec.legacy) throws {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted,.sortedKeys]
-        try encoder.encode(r).write(to: recordURL(app), options: .atomic)
+        try encoder.encode(r).write(to: recordURL(app, profile: profile), options: .atomic)
     }
     private func withLock(_ app: URL, _ operation: () throws -> Void) throws {
         try fm.createDirectory(at:backupRoot,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
@@ -156,14 +198,16 @@ final class PatchEngine {
         do {
             let version = try validateApp(app)
             let hash = try PatchSpec.hashFile(binary(app))
-            if hash == PatchSpec.originalHash { return Inspection(path: app.path,version: version,state: .ready,detail: "이 버전은 광고 영역을 숨길 수 있습니다.") }
-            if let r = try? loadRecord(app), r.schema == 1, r.targetPath == app.path, r.originalHash == PatchSpec.originalHash, r.installedHash == hash {
-                let saved = backupDirectory(app).appendingPathComponent("Original.backup/Contents/MacOS/KakaoTalk")
-                let valid = (try? PatchSpec.hashFile(saved)) == PatchSpec.originalHash
-                let repaired = hasLibraryException(app)
-                return Inspection(path: app.path,version: version,state: valid ? (repaired ? .applied : .needsRepair) : .damagedBackup,detail: valid ? (repaired ? "광고 영역 숨김이 적용되어 있습니다." : "앱 실행을 위한 서명 복구가 필요합니다.") : "원본 백업이 없거나 손상되었습니다.")
+            if PatchSpec.profile(for: hash) != nil { return Inspection(path: app.path,version: version,state: .ready,detail: "이 버전은 광고 영역을 숨길 수 있습니다.") }
+            for profile in PatchSpec.profiles {
+                if let r = try? loadRecord(app, profile: profile), r.schema == 1, r.targetPath == app.path, r.originalHash == profile.originalHash, r.installedHash == hash {
+                    let saved = backupDirectory(app, profile: profile).appendingPathComponent("Original.backup/Contents/MacOS/KakaoTalk")
+                    let valid = (try? PatchSpec.hashFile(saved)) == profile.originalHash
+                    let repaired = hasLibraryException(app)
+                    return Inspection(path: app.path,version: version,state: valid ? (repaired ? .applied : .needsRepair) : .damagedBackup,detail: valid ? (repaired ? "광고 영역 숨김이 적용되어 있습니다." : "앱 실행을 위한 서명 복구가 필요합니다.") : "원본 백업이 없거나 손상되었습니다.")
+                }
             }
-            return Inspection(path: app.path,version: version,state: .unsupported,detail: "현재는 26.9.0 (2006) Apple Silicon 빌드만 지원합니다.")
+            return Inspection(path: app.path,version: version,state: .unsupported,detail: "분석된 Apple Silicon 빌드만 지원합니다.")
         } catch { return Inspection(path: app.path,version: "—",state: .missing,detail: error.localizedDescription) }
     }
     func ensureStopped(_ app: URL) throws {
@@ -210,7 +254,7 @@ final class PatchEngine {
         }
         return nil
     }
-    func sign(_ staged: URL, _ working: URL) throws {
+    func sign(_ staged: URL, _ working: URL, profile: PatchProfile) throws {
         guard let beforeEntitlements = try MachO.entitlements(binary(staged)) else { throw PatchFailure.message("원본 앱의 권한 정보를 찾지 못했습니다.") }
         guard var beforeDictionary = try PropertyListSerialization.propertyList(from:beforeEntitlements,format:nil) as? [String:Any] else { throw PatchFailure.message("앱 권한 정보를 읽지 못했습니다.") }
         beforeDictionary["com.apple.security.cs.disable-library-validation"] = true
@@ -249,8 +293,13 @@ final class PatchEngine {
               d == beforeDictionary as NSDictionary,
               d["com.apple.security.app-sandbox"] as? Bool == true else { throw PatchFailure.message("재서명 후 앱 권한 보존을 확인하지 못했습니다.") }
         let signed = try Data(contentsOf:binary(staged))
-        guard let arm = try MachO.slices(signed).first(where: { $0.cpu == 0x0100000c }),
-              signed.subdata(in:arm.offset+PatchSpec.offset..<arm.offset+PatchSpec.offset+8) == PatchSpec.replacement else { throw PatchFailure.message("재서명 후 패치 검증에 실패했습니다.") }
+        guard let arm = try MachO.slices(signed).first(where: { $0.cpu == 0x0100000c }) else { throw PatchFailure.message("재서명 후 Apple Silicon 실행 파일을 찾지 못했습니다.") }
+        for site in profile.sites {
+            guard site.offset >= 0, site.offset <= arm.size - site.replacement.count,
+                  signed.subdata(in:arm.offset+site.offset..<arm.offset+site.offset+site.replacement.count) == site.replacement else {
+                throw PatchFailure.message("재서명 후 패치 검증에 실패했습니다.")
+            }
+        }
     }
     func quote(_ s: String) -> String { "'" + s.replacingOccurrences(of:"'",with:"'\\''") + "'" }
     func install(_ staged: URL, at target: URL, expectedCurrent: String, expectedNew: String, verifySignature: Bool) throws {
@@ -304,13 +353,14 @@ final class PatchEngine {
         guard inspect(app).canApply else { throw PatchFailure.message("이 앱에는 패치를 적용할 수 없습니다. 상태를 다시 확인해주세요.") }
         try ensureStopped(app)
         let original = try Data(contentsOf: binary(app)); let candidate = try PatchSpec.patch(original)
-        let dir = backupDirectory(app)
+        guard let profile = PatchSpec.profile(for: PatchSpec.hash(original)) else { throw PatchFailure.message("지원하지 않는 원본입니다.") }
+        let dir = backupDirectory(app, profile: profile)
         guard !fm.fileExists(atPath: dir.path) else {
             // Reuse a verified original after a previous completed restore.
-            let record = try loadRecord(app)
+            let record = try loadRecord(app, profile: profile)
             let saved = dir.appendingPathComponent("Original.backup")
-            guard record.targetPath == app.path, record.originalHash == PatchSpec.originalHash, try inventory(saved) == record.inventory else { throw PatchFailure.message("기존 백업을 확인할 수 없습니다. 백업 폴더를 확인해주세요.") }
-            try applyWithBackup(app,candidate: candidate,record: record,simulateFailure: simulateFailure)
+            guard record.targetPath == app.path, record.originalHash == profile.originalHash, try inventory(saved) == record.inventory else { throw PatchFailure.message("기존 백업을 확인할 수 없습니다. 백업 폴더를 확인해주세요.") }
+            try applyWithBackup(app,candidate: candidate,record: record,profile: profile,simulateFailure: simulateFailure)
             return
         }
         try fm.createDirectory(at: dir,withIntermediateDirectories: true,attributes: [.posixPermissions:0o700])
@@ -320,20 +370,21 @@ final class PatchEngine {
             try copy(app,saved)
             let index = try inventory(saved)
             let sourceIndex = try inventory(app)
-            guard sourceIndex == index, try PatchSpec.hashFile(binary(saved)) == PatchSpec.originalHash else {
+            guard sourceIndex == index, try PatchSpec.hashFile(binary(saved)) == profile.originalHash else {
                 let differences = Set(sourceIndex.keys).union(index.keys).filter { sourceIndex[$0] != index[$0] }.sorted().prefix(6)
                 throw PatchFailure.message("원본 백업 검증에 실패했습니다.\n" + differences.joined(separator:"\n"))
             }
-            let record = BackupRecord(schema:1,targetPath:app.path,originalHash:PatchSpec.originalHash,createdAt:Date(),inventory:index,installedHash:nil)
-            try saveRecord(record,app)
-            try applyWithBackup(app,candidate:candidate,record:record,simulateFailure:simulateFailure)
+            let record = BackupRecord(schema:1,targetPath:app.path,originalHash:profile.originalHash,createdAt:Date(),inventory:index,installedHash:nil)
+            try saveRecord(record,app,profile:profile)
+            try applyWithBackup(app,candidate:candidate,record:record,profile:profile,simulateFailure:simulateFailure)
         } catch {
-            if !fm.fileExists(atPath: recordURL(app).path) { try? fm.removeItem(at:dir) }
+            if !fm.fileExists(atPath: recordURL(app, profile: profile).path) { try? fm.removeItem(at:dir) }
             throw error
         }
     }
-    private func applyWithBackup(_ app: URL, candidate: Data, record: BackupRecord, simulateFailure: Bool, expectedCurrent: String = PatchSpec.originalHash) throws {
-        let dir = backupDirectory(app), work = dir.appendingPathComponent("work-"+UUID().uuidString)
+    private func applyWithBackup(_ app: URL, candidate: Data, record: BackupRecord, profile: PatchProfile, simulateFailure: Bool, expectedCurrent: String? = nil) throws {
+        let expectedCurrent = expectedCurrent ?? profile.originalHash
+        let dir = backupDirectory(app, profile: profile), work = dir.appendingPathComponent("work-"+UUID().uuidString)
         try fm.createDirectory(at:work,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
         defer { try? fm.removeItem(at:work) }
         let staged = work.appendingPathComponent("KakaoTalk.app")
@@ -342,30 +393,43 @@ final class PatchEngine {
         try candidate.write(to:binary(staged),options:.atomic)
         try fm.setAttributes([.posixPermissions:0o755],ofItemAtPath:binary(staged).path)
         progress("앱 권한과 서명을 확인하고 있습니다…")
-        try sign(staged,work)
+        try sign(staged,work,profile:profile)
         let signedHash = try PatchSpec.hashFile(binary(staged))
         if simulateFailure { throw PatchFailure.message("테스트: 설치 직전 중단") }
         try ensureStopped(app)
-        if expectedCurrent == PatchSpec.originalHash {
+        if expectedCurrent == profile.originalHash {
             guard try inventory(app) == record.inventory else { throw PatchFailure.message("준비 중 앱 내용이 변경되어 적용을 중단했습니다.") }
         } else {
             guard try PatchSpec.hashFile(binary(app)) == expectedCurrent else { throw PatchFailure.message("준비 중 앱 내용이 변경되어 복구를 중단했습니다.") }
         }
         var updated = record; updated.installedHash = signedHash
-        try saveRecord(updated,app) // Persist recovery information before the swap.
+        try saveRecord(updated,app,profile:profile) // Persist recovery information before the swap.
         progress("설치된 카카오톡에 적용하고 있습니다…")
         try install(staged,at:app,expectedCurrent:expectedCurrent,expectedNew:signedHash,verifySignature:true)
         guard inspect(app).state == .applied else { throw PatchFailure.message("설치 후 상태 확인에 실패했습니다. 원본 복원을 사용해주세요.") }
     }
+    private func matchingRecord(_ app: URL) throws -> (PatchProfile, BackupRecord) {
+        let current = try PatchSpec.hashFile(binary(app))
+        let matches = PatchSpec.profiles.compactMap { profile -> (PatchProfile, BackupRecord)? in
+            guard let record = try? loadRecord(app, profile: profile), record.schema == 1,
+                  record.targetPath == app.path, record.originalHash == profile.originalHash,
+                  record.installedHash == current else { return nil }
+            return (profile, record)
+        }
+        guard matches.count == 1, let match = matches.first else { throw PatchFailure.message("현재 앱에 해당하는 백업 기록을 확인하지 못했습니다.") }
+        return match
+    }
+
     func repair(_ app: URL, allowLibraryValidationException: Bool = false) throws {
         guard allowLibraryValidationException else { throw PatchFailure.message("앱별 라이브러리 서명 검증 예외에 대한 동의가 필요합니다.") }
         try withLock(app) {
             guard inspect(app).canRepair else { throw PatchFailure.message("복구할 이전 적용 기록이 없습니다.") }
             try ensureStopped(app)
-            let record = try loadRecord(app), saved = backupDirectory(app).appendingPathComponent("Original.backup")
+            let (profile, record) = try matchingRecord(app)
+            let saved = backupDirectory(app, profile: profile).appendingPathComponent("Original.backup")
             guard let current = record.installedHash, try inventory(saved) == record.inventory else { throw PatchFailure.message("원본 백업이 변경되어 복구를 중단했습니다.") }
             let candidate = try PatchSpec.patch(Data(contentsOf:binary(saved)))
-            try applyWithBackup(app,candidate:candidate,record:record,simulateFailure:false,expectedCurrent:current)
+            try applyWithBackup(app,candidate:candidate,record:record,profile:profile,simulateFailure:false,expectedCurrent:current)
         }
     }
     func restore(_ app: URL) throws { try withLock(app) { try restoreUnlocked(app) } }
@@ -373,12 +437,13 @@ final class PatchEngine {
         let app = app.standardizedFileURL
         guard inspect(app).canRestore else { throw PatchFailure.message("복원 가능한 적용 기록이 없습니다.") }
         try ensureStopped(app)
-        let record = try loadRecord(app), saved = backupDirectory(app).appendingPathComponent("Original.backup")
+        let (profile, record) = try matchingRecord(app)
+        let saved = backupDirectory(app, profile: profile).appendingPathComponent("Original.backup")
         progress("원본 백업 전체를 확인하고 있습니다…")
-        guard try inventory(saved) == record.inventory, try PatchSpec.hashFile(binary(saved)) == PatchSpec.originalHash,
+        guard try inventory(saved) == record.inventory, try PatchSpec.hashFile(binary(saved)) == profile.originalHash,
               let current = record.installedHash else { throw PatchFailure.message("백업이 변경되어 복원을 중단했습니다. 현재 앱은 유지됩니다.") }
         progress("원래 카카오톡으로 복원하고 있습니다…")
-        try install(saved,at:app,expectedCurrent:current,expectedNew:PatchSpec.originalHash,verifySignature:false)
+        try install(saved,at:app,expectedCurrent:current,expectedNew:profile.originalHash,verifySignature:false)
         guard try inventory(app) == record.inventory else { throw PatchFailure.message("복원 파일 검증에 실패했습니다. 원본 백업은 보관되어 있습니다.") }
     }
 }
